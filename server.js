@@ -41,16 +41,72 @@ function jsonResp(res, code, data) {
   res.end(body);
 }
 
+// Fetch the filing index page and find the best .htm document
+function findDocInIndex(cik, accNo, accNoDashes) {
+  var indexUrl = "https://www.sec.gov/Archives/edgar/data/" + cik + "/" + accNoDashes + "/" + accNo + "-index.htm";
+  return get(indexUrl).then(function(r) {
+    if (r.status !== 200) {
+      throw new Error("Could not fetch filing index (HTTP " + r.status + "): " + indexUrl);
+    }
+    var html = r.body;
+
+    // Find all .htm links in the index, excluding the index itself
+    var matches = html.match(/href="([^"]+\.htm)"/gi) || [];
+    var htmFiles = [];
+    for (var i = 0; i < matches.length; i++) {
+      var m = matches[i].match(/href="([^"]+\.htm)"/i);
+      if (m) {
+        var f = m[1];
+        // Exclude the index file itself and any absolute URLs
+        if (f.indexOf("index") === -1 && f.indexOf("http") === -1) {
+          htmFiles.push(f);
+        }
+      }
+    }
+
+    if (htmFiles.length === 0) {
+      throw new Error("No documents found in filing index: " + indexUrl);
+    }
+
+    // Prefer files that look like the main schedule (largest, or named with common patterns)
+    // Try each file until we find one that returns 200
+    var baseUrl = "https://www.sec.gov/Archives/edgar/data/" + cik + "/" + accNoDashes + "/";
+
+    function tryFile(i) {
+      if (i >= htmFiles.length) {
+        throw new Error("None of the filing documents could be fetched. Index: " + indexUrl);
+      }
+      var fileUrl = htmFiles[i].startsWith("/")
+        ? "https://www.sec.gov" + htmFiles[i]
+        : baseUrl + htmFiles[i];
+
+      return get(fileUrl).then(function(r2) {
+        if (r2.status === 200 && r2.body.length > 1000) {
+          return { docUrl: fileUrl, body: r2.body };
+        }
+        return tryFile(i + 1);
+      });
+    }
+
+    return tryFile(0).then(function(result) {
+      return { docUrl: result.docUrl, body: result.body, indexUrl: indexUrl };
+    });
+  });
+}
+
 function findDocUrl(query) {
   var queries = ['"' + query + '"', query];
   var index = 0;
 
   function tryNext() {
     if (index >= queries.length) {
-      return Promise.reject(new Error('No NPORT-P filing found for "' + query + '". Try the full fund name e.g. "Fidelity Contrafund" not "FCNTX".'));
+      return Promise.reject(new Error(
+        'No NPORT-P filing found for "' + query + '". Try the full fund name e.g. "Fidelity Contrafund" not "FCNTX".'
+      ));
     }
     var q = queries[index++];
-    var searchUrl = "https://efts.sec.gov/LATEST/search-index?q=" + encodeURIComponent(q) + "&forms=NPORT-P&dateRange=custom&startdt=2023-01-01&enddt=2026-12-31";
+    var searchUrl = "https://efts.sec.gov/LATEST/search-index?q=" + encodeURIComponent(q) +
+      "&forms=NPORT-P&dateRange=custom&startdt=2023-01-01&enddt=2026-12-31";
 
     return get(searchUrl).then(function(r) {
       if (r.status === 403) throw new Error("SEC EDGAR returned 403. Update YOUR_EMAIL_HERE in server.js.");
@@ -67,39 +123,28 @@ function findDocUrl(query) {
       // _id format: "0001234567-24-001234:filename.htm"
       var idParts = hit._id.split(":");
       var accNo = idParts[0];
-      var filename = idParts[1];
-      if (!accNo || !filename) throw new Error("Unexpected _id format: " + hit._id);
+      if (!accNo) throw new Error("Could not parse accession number from: " + hit._id);
 
       var accNoDashes = accNo.replace(/-/g, "");
 
-      // The CIK is ALWAYS the first 10 digits of the accession number
-      // e.g. "0000811030-24-059987" -> CIK is "0000811030"
-      // This is more reliable than any _source field
+      // CIK is always the first segment of the accession number
       var cik = accNo.split("-")[0];
       if (!cik || !/^\d+$/.test(cik)) {
         throw new Error("Could not extract CIK from accession number: " + accNo);
       }
 
       return {
-        docUrl: "https://www.sec.gov/Archives/edgar/data/" + cik + "/" + accNoDashes + "/" + filename,
-        indexUrl: "https://www.sec.gov/Archives/edgar/data/" + cik + "/" + accNoDashes + "/" + accNo + "-index.htm",
+        cik: cik,
+        accNo: accNo,
+        accNoDashes: accNoDashes,
         period: src.period_of_report,
         filingDate: src.file_date,
-        entityName: src.entity_name,
-        cik: cik,
-        accNo: accNo
+        entityName: src.entity_name
       };
     });
   }
 
   return tryNext();
-}
-
-function fetchDoc(docUrl) {
-  return get(docUrl).then(function(r) {
-    if (r.status !== 200) throw new Error("Failed to fetch filing (HTTP " + r.status + "): " + docUrl);
-    return r.body;
-  });
 }
 
 function parseHoldings(html) {
@@ -175,14 +220,15 @@ function parseHoldings(html) {
 
 function handleSearch(req, res, query) {
   findDocUrl(query).then(function(filing) {
-    return fetchDoc(filing.docUrl).then(function(html) {
-      var result = parseHoldings(html);
+    // Fetch index page to find the correct document
+    return findDocInIndex(filing.cik, filing.accNo, filing.accNoDashes).then(function(doc) {
+      var result = parseHoldings(doc.body);
       var holdings = result.holdings;
 
       if (holdings.length < 3) {
         return jsonResp(res, 422, {
-          error: "Only parsed " + holdings.length + " holdings. The document format may be unsupported.",
-          docUrl: filing.docUrl
+          error: "Only parsed " + holdings.length + " holdings. Document may be in an unsupported format.",
+          docUrl: doc.docUrl
         });
       }
 
@@ -192,8 +238,8 @@ function handleSearch(req, res, query) {
         fundName: filing.entityName,
         period: filing.period,
         filingDate: filing.filingDate,
-        docUrl: filing.docUrl,
-        indexUrl: filing.indexUrl,
+        docUrl: doc.docUrl,
+        indexUrl: doc.indexUrl,
         netAssets: total,
         count: holdings.length,
         holdings: holdings.map(function(h) {
