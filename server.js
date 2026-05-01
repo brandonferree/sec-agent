@@ -41,52 +41,72 @@ function jsonResp(res, code, data) {
   res.end(body);
 }
 
-// ── Strategy 1: Ticker → CIK via SEC company_tickers.json ────────────────
+// ── Strategy 1: Ticker → CIK via mutual fund ticker list ─────────────────
+// Uses company_tickers_mf.json which covers mutual fund tickers (OAKLX, BVEFX etc)
+// Falls back to company_tickers.json for ETFs and stock-listed funds
 function lookupByTicker(ticker) {
   var upper = ticker.toUpperCase().trim();
-  return get("https://data.sec.gov/files/company_tickers.json").then(function(r) {
-    if (r.status !== 200) throw new Error("Could not fetch SEC ticker list (HTTP " + r.status + ")");
+
+  // Try mutual fund list first
+  return get("https://www.sec.gov/files/company_tickers_mf.json").then(function(r) {
+    if (r.status !== 200) throw new Error("Could not fetch mutual fund ticker list (HTTP " + r.status + ")");
     var data = JSON.parse(r.body);
-    // data is an object of {0: {cik_str, ticker, title}, 1: ...}
-    var entries = Object.values(data);
-    for (var i = 0; i < entries.length; i++) {
-      if (entries[i].ticker === upper) {
-        var cik = String(entries[i].cik_str).padStart(10, "0");
-        return { cik: cik, name: entries[i].title, ticker: upper };
+    // Format: { data: [[cik, seriesId, classId, symbol], ...], fields: [...] }
+    var rows = data.data || [];
+    for (var i = 0; i < rows.length; i++) {
+      var row = rows[i];
+      // row[3] is the ticker symbol
+      if (row[3] && row[3].toUpperCase() === upper) {
+        var cik = String(row[0]).padStart(10, "0");
+        return { cik: cik, name: upper, ticker: upper };
       }
     }
-    return null; // not found
+    return null; // not in MF list, will try stock tickers next
+  }).then(function(result) {
+    if (result) return result;
+    // Try regular stock/ETF ticker list as fallback
+    return get("https://www.sec.gov/files/company_tickers.json").then(function(r) {
+      if (r.status !== 200) return null;
+      var data = JSON.parse(r.body);
+      var entries = Object.values(data);
+      for (var i = 0; i < entries.length; i++) {
+        if (entries[i].ticker && entries[i].ticker.toUpperCase() === upper) {
+          var cik = String(entries[i].cik_str).padStart(10, "0");
+          return { cik: cik, name: entries[i].title, ticker: upper };
+        }
+      }
+      return null;
+    });
   });
 }
 
 // ── Strategy 2: CIK → latest NPORT-P via submissions API ─────────────────
 function getLatestNportByCik(cik, name) {
   return get("https://data.sec.gov/submissions/CIK" + cik + ".json").then(function(r) {
-    if (r.status !== 200) throw new Error("Could not fetch SEC submissions for CIK " + cik);
+    if (r.status !== 200) throw new Error("Could not fetch SEC submissions for CIK " + cik + " (HTTP " + r.status + ")");
     var data = JSON.parse(r.body);
     var filings = data.filings && data.filings.recent;
     if (!filings) throw new Error("No filings found for CIK " + cik);
 
-    var forms = filings.form;
-    var dates = filings.filingDate;
+    var forms      = filings.form;
+    var dates      = filings.filingDate;
     var accessions = filings.accessionNumber;
+    var periods    = filings.periodOfReport;
 
-    // Find most recent NPORT-P
     for (var i = 0; i < forms.length; i++) {
       if (forms[i] === "NPORT-P") {
         var accNo = accessions[i];
-        var accNoDashes = accNo.replace(/-/g, "");
         return {
           cik: cik,
           accNo: accNo,
-          accNoDashes: accNoDashes,
-          period: filings.periodOfReport ? filings.periodOfReport[i] : dates[i],
+          accNoDashes: accNo.replace(/-/g, ""),
+          period: periods ? periods[i] : dates[i],
           filingDate: dates[i],
           entityName: name || data.name
         };
       }
     }
-    throw new Error("No NPORT-P filing found for ticker. This fund may not file holdings with the SEC.");
+    throw new Error('No NPORT-P filing found for ticker "' + name + '". This fund may not file NPORT-P with the SEC.');
   });
 }
 
@@ -98,7 +118,7 @@ function searchByName(query) {
   function tryNext() {
     if (index >= queries.length) {
       return Promise.reject(new Error(
-        'No NPORT-P filing found for "' + query + '". Try a different name or check the fund files with the SEC.'
+        'No NPORT-P filing found for "' + query + '". Try a different spelling or check that the fund files with the SEC.'
       ));
     }
     var q = queries[index++];
@@ -114,19 +134,17 @@ function searchByName(query) {
       var hits = data.hits && data.hits.hits;
       if (!hits || hits.length === 0) return tryNext();
 
-      var hit = hits[0];
-      var src = hit._source;
-      var accNo = hit._id.split(":")[0];
-      var accNoDashes = accNo.replace(/-/g, "");
-      var cik = accNo.split("-")[0];
+      var hit    = hits[0];
+      var src    = hit._source;
+      var accNo  = hit._id.split(":")[0];
 
       return {
-        cik: cik,
-        accNo: accNo,
-        accNoDashes: accNoDashes,
-        period: src.period_of_report,
-        filingDate: src.file_date,
-        entityName: src.entity_name
+        cik:         accNo.split("-")[0],
+        accNo:       accNo,
+        accNoDashes: accNo.replace(/-/g, ""),
+        period:      src.period_of_report,
+        filingDate:  src.file_date,
+        entityName:  src.entity_name
       };
     });
   }
@@ -142,8 +160,7 @@ function findDocInIndex(filing) {
   return get(indexUrl).then(function(r) {
     if (r.status !== 200) throw new Error("Could not fetch filing index (HTTP " + r.status + ")");
 
-    var html = r.body;
-    var matches = html.match(/href="([^"]+\.htm)"/gi) || [];
+    var matches  = r.body.match(/href="([^"]+\.htm)"/gi) || [];
     var htmFiles = [];
     for (var i = 0; i < matches.length; i++) {
       var m = matches[i].match(/href="([^"]+\.htm)"/i);
@@ -157,7 +174,7 @@ function findDocInIndex(filing) {
     var baseUrl = "https://www.sec.gov/Archives/edgar/data/" + filing.cik + "/" + filing.accNoDashes + "/";
 
     function tryFile(i) {
-      if (i >= htmFiles.length) throw new Error("Could not load any document from filing index: " + indexUrl);
+      if (i >= htmFiles.length) throw new Error("Could not load any document from filing. Index: " + indexUrl);
       var fileUrl = htmFiles[i].startsWith("/")
         ? "https://www.sec.gov" + htmFiles[i]
         : baseUrl + htmFiles[i];
@@ -186,9 +203,9 @@ function parseHoldings(html) {
 
   var inThousands = /in thousands/i.test(html);
   var holdings = [];
-  var seen = {};
-  var sector = null;
-  var rows = html.match(/<tr[\s\S]*?<\/tr>/gi) || [];
+  var seen     = {};
+  var sector   = null;
+  var rows     = html.match(/<tr[\s\S]*?<\/tr>/gi) || [];
 
   for (var i = 0; i < rows.length; i++) {
     var cellMatches = rows[i].match(/<t[dh][^>]*>([\s\S]*?)<\/t[dh]>/gi) || [];
@@ -201,8 +218,7 @@ function parseHoldings(html) {
 
     var sh = full.match(/^([A-Z][A-Za-z ,&\/()\-]+?)\s*[:\-]+\s*[\d.]+\s*%/);
     if (sh && !cells.some(function(c) { return /^\$?[\d]{1,3}(,\d{3})+$/.test(c.trim()); })) {
-      sector = sh[1].trim();
-      continue;
+      sector = sh[1].trim(); continue;
     }
 
     if (/^TOTAL\b|^Grand Total|^Common Stocks|^Shares$|^Value$/i.test(full.trim())) continue;
@@ -214,8 +230,8 @@ function parseHoldings(html) {
     }
     if (!valueCell) continue;
 
-    var valueNum = parseInt(valueCell.replace(/[$,\s]/g, ""));
-    var sharesCell = null;
+    var valueNum    = parseInt(valueCell.replace(/[$,\s]/g, ""));
+    var sharesCell  = null;
     for (var k = 0; k < cells.length; k++) {
       var sn = cells[k].replace(/[,\s]/g, "");
       if (/^\d+$/.test(sn) && sn !== valueCell.replace(/[$,\s]/g, "") && parseInt(sn) > 0) {
@@ -224,7 +240,7 @@ function parseHoldings(html) {
     }
 
     var nameCell = null;
-    var maxLen = 0;
+    var maxLen   = 0;
     for (var m = 0; m < cells.length; m++) {
       var c2 = cells[m];
       if (c2.length > 2 && !/^[\$\d,().%\-]+$/.test(c2) && !/^TOTAL|^Shares$|^Value$|^Common Stocks/i.test(c2)) {
@@ -233,9 +249,9 @@ function parseHoldings(html) {
     }
     if (!nameCell) continue;
 
-    var value = inThousands ? valueNum * 1000 : valueNum;
+    var value  = inThousands ? valueNum * 1000 : valueNum;
     var shares = sharesCell ? parseInt(sharesCell.replace(/,/g, "")) : null;
-    var name = nameCell.replace(/\s*\([a-z,\/]\)\s*/gi, "").replace(/\s+/g, " ").trim();
+    var name   = nameCell.replace(/\s*\([a-z,\/]\)\s*/gi, "").replace(/\s+/g, " ").trim();
 
     if (!name || value <= 0 || seen[name]) continue;
     seen[name] = true;
@@ -245,53 +261,48 @@ function parseHoldings(html) {
   return { holdings: holdings };
 }
 
-// ── Main search handler ───────────────────────────────────────────────────
+// ── Main search: ticker first, then name ──────────────────────────────────
 function handleSearch(req, res, query) {
-  var trimmed = query.trim();
-
-  // Decide: looks like a ticker (short, no spaces, all letters) → try ticker first
+  var trimmed       = query.trim();
   var looksLikeTicker = /^[A-Za-z]{1,6}$/.test(trimmed);
 
   var filingPromise;
 
   if (looksLikeTicker) {
-    // Try ticker lookup first, fall back to name search
     filingPromise = lookupByTicker(trimmed).then(function(result) {
       if (!result) {
-        // Ticker not found in list, try name search
+        // Not found in any ticker list, fall back to name search
         return searchByName(trimmed);
       }
-      // Got CIK, now find latest NPORT-P via submissions API
       return getLatestNportByCik(result.cik, result.name);
     });
   } else {
-    // Looks like a fund name, go straight to full-text search
     filingPromise = searchByName(trimmed);
   }
 
   filingPromise.then(function(filing) {
     return findDocInIndex(filing).then(function(doc) {
-      var result = parseHoldings(doc.body);
+      var result   = parseHoldings(doc.body);
       var holdings = result.holdings;
 
       if (holdings.length < 3) {
         return jsonResp(res, 422, {
-          error: "Only parsed " + holdings.length + " holdings. Document may be in an unsupported format.",
+          error:  "Only parsed " + holdings.length + " holdings. Document format may be unsupported.",
           docUrl: doc.docUrl
         });
       }
 
       var total = holdings.reduce(function(s, h) { return s + h.value; }, 0);
       jsonResp(res, 200, {
-        query: trimmed,
-        fundName: filing.entityName,
-        period: filing.period,
+        query:      trimmed,
+        fundName:   filing.entityName,
+        period:     filing.period,
         filingDate: filing.filingDate,
-        docUrl: doc.docUrl,
-        indexUrl: doc.indexUrl,
-        netAssets: total,
-        count: holdings.length,
-        holdings: holdings.map(function(h) {
+        docUrl:     doc.docUrl,
+        indexUrl:   doc.indexUrl,
+        netAssets:  total,
+        count:      holdings.length,
+        holdings:   holdings.map(function(h) {
           return Object.assign({}, h, { pct: parseFloat(((h.value / total) * 100).toFixed(4)) });
         })
       });
@@ -301,11 +312,11 @@ function handleSearch(req, res, query) {
   });
 }
 
-// ── Static file server ────────────────────────────────────────────────────
+// ── Static files ──────────────────────────────────────────────────────────
 function serveStatic(res, filePath) {
-  var ext = path.extname(filePath);
+  var ext   = path.extname(filePath);
   var types = { ".html": "text/html", ".js": "application/javascript", ".css": "text/css" };
-  var type = types[ext] || "text/plain";
+  var type  = types[ext] || "text/plain";
   fs.readFile(filePath, function(err, data) {
     if (err) { res.writeHead(404); res.end("Not found"); return; }
     res.writeHead(200, { "Content-Type": type });
@@ -314,14 +325,13 @@ function serveStatic(res, filePath) {
 }
 
 http.createServer(function(req, res) {
-  var parsed = url.parse(req.url, true);
+  var parsed   = url.parse(req.url, true);
   var pathname = parsed.pathname;
-  var qs = parsed.query;
+  var qs       = parsed.query;
 
   if (req.method === "OPTIONS") {
     res.writeHead(204, { "Access-Control-Allow-Origin": "*" });
-    res.end();
-    return;
+    res.end(); return;
   }
 
   if (pathname === "/api/search") {
@@ -334,8 +344,7 @@ http.createServer(function(req, res) {
     return serveStatic(res, path.join(__dirname, "public", "index.html"));
   }
 
-  res.writeHead(404);
-  res.end("Not found");
+  res.writeHead(404); res.end("Not found");
 }).listen(PORT, function() {
   console.log("SEC Holdings Agent running on port " + PORT);
 });
