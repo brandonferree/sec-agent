@@ -41,67 +41,64 @@ function jsonResp(res, code, data) {
   res.end(body);
 }
 
-// Fetch the filing index page and find the best .htm document
-function findDocInIndex(cik, accNo, accNoDashes) {
-  var indexUrl = "https://www.sec.gov/Archives/edgar/data/" + cik + "/" + accNoDashes + "/" + accNo + "-index.htm";
-  return get(indexUrl).then(function(r) {
-    if (r.status !== 200) {
-      throw new Error("Could not fetch filing index (HTTP " + r.status + "): " + indexUrl);
-    }
-    var html = r.body;
-
-    // Find all .htm links in the index, excluding the index itself
-    var matches = html.match(/href="([^"]+\.htm)"/gi) || [];
-    var htmFiles = [];
-    for (var i = 0; i < matches.length; i++) {
-      var m = matches[i].match(/href="([^"]+\.htm)"/i);
-      if (m) {
-        var f = m[1];
-        // Exclude the index file itself and any absolute URLs
-        if (f.indexOf("index") === -1 && f.indexOf("http") === -1) {
-          htmFiles.push(f);
-        }
+// ── Strategy 1: Ticker → CIK via SEC company_tickers.json ────────────────
+function lookupByTicker(ticker) {
+  var upper = ticker.toUpperCase().trim();
+  return get("https://data.sec.gov/files/company_tickers.json").then(function(r) {
+    if (r.status !== 200) throw new Error("Could not fetch SEC ticker list (HTTP " + r.status + ")");
+    var data = JSON.parse(r.body);
+    // data is an object of {0: {cik_str, ticker, title}, 1: ...}
+    var entries = Object.values(data);
+    for (var i = 0; i < entries.length; i++) {
+      if (entries[i].ticker === upper) {
+        var cik = String(entries[i].cik_str).padStart(10, "0");
+        return { cik: cik, name: entries[i].title, ticker: upper };
       }
     }
-
-    if (htmFiles.length === 0) {
-      throw new Error("No documents found in filing index: " + indexUrl);
-    }
-
-    // Prefer files that look like the main schedule (largest, or named with common patterns)
-    // Try each file until we find one that returns 200
-    var baseUrl = "https://www.sec.gov/Archives/edgar/data/" + cik + "/" + accNoDashes + "/";
-
-    function tryFile(i) {
-      if (i >= htmFiles.length) {
-        throw new Error("None of the filing documents could be fetched. Index: " + indexUrl);
-      }
-      var fileUrl = htmFiles[i].startsWith("/")
-        ? "https://www.sec.gov" + htmFiles[i]
-        : baseUrl + htmFiles[i];
-
-      return get(fileUrl).then(function(r2) {
-        if (r2.status === 200 && r2.body.length > 1000) {
-          return { docUrl: fileUrl, body: r2.body };
-        }
-        return tryFile(i + 1);
-      });
-    }
-
-    return tryFile(0).then(function(result) {
-      return { docUrl: result.docUrl, body: result.body, indexUrl: indexUrl };
-    });
+    return null; // not found
   });
 }
 
-function findDocUrl(query) {
+// ── Strategy 2: CIK → latest NPORT-P via submissions API ─────────────────
+function getLatestNportByCik(cik, name) {
+  return get("https://data.sec.gov/submissions/CIK" + cik + ".json").then(function(r) {
+    if (r.status !== 200) throw new Error("Could not fetch SEC submissions for CIK " + cik);
+    var data = JSON.parse(r.body);
+    var filings = data.filings && data.filings.recent;
+    if (!filings) throw new Error("No filings found for CIK " + cik);
+
+    var forms = filings.form;
+    var dates = filings.filingDate;
+    var accessions = filings.accessionNumber;
+
+    // Find most recent NPORT-P
+    for (var i = 0; i < forms.length; i++) {
+      if (forms[i] === "NPORT-P") {
+        var accNo = accessions[i];
+        var accNoDashes = accNo.replace(/-/g, "");
+        return {
+          cik: cik,
+          accNo: accNo,
+          accNoDashes: accNoDashes,
+          period: filings.periodOfReport ? filings.periodOfReport[i] : dates[i],
+          filingDate: dates[i],
+          entityName: name || data.name
+        };
+      }
+    }
+    throw new Error("No NPORT-P filing found for ticker. This fund may not file holdings with the SEC.");
+  });
+}
+
+// ── Strategy 3: Fund name → EDGAR full-text search ───────────────────────
+function searchByName(query) {
   var queries = ['"' + query + '"', query];
   var index = 0;
 
   function tryNext() {
     if (index >= queries.length) {
       return Promise.reject(new Error(
-        'No NPORT-P filing found for "' + query + '". Try the full fund name e.g. "Fidelity Contrafund" not "FCNTX".'
+        'No NPORT-P filing found for "' + query + '". Try a different name or check the fund files with the SEC.'
       ));
     }
     var q = queries[index++];
@@ -110,7 +107,7 @@ function findDocUrl(query) {
 
     return get(searchUrl).then(function(r) {
       if (r.status === 403) throw new Error("SEC EDGAR returned 403. Update YOUR_EMAIL_HERE in server.js.");
-      if (r.status !== 200) throw new Error("EDGAR search returned HTTP " + r.status + ": " + r.body.slice(0, 80));
+      if (r.status !== 200) throw new Error("EDGAR search returned HTTP " + r.status);
       if (!r.ct.includes("json")) throw new Error("EDGAR returned unexpected response: " + r.body.slice(0, 80));
 
       var data = JSON.parse(r.body);
@@ -119,19 +116,9 @@ function findDocUrl(query) {
 
       var hit = hits[0];
       var src = hit._source;
-
-      // _id format: "0001234567-24-001234:filename.htm"
-      var idParts = hit._id.split(":");
-      var accNo = idParts[0];
-      if (!accNo) throw new Error("Could not parse accession number from: " + hit._id);
-
+      var accNo = hit._id.split(":")[0];
       var accNoDashes = accNo.replace(/-/g, "");
-
-      // CIK is always the first segment of the accession number
       var cik = accNo.split("-")[0];
-      if (!cik || !/^\d+$/.test(cik)) {
-        throw new Error("Could not extract CIK from accession number: " + accNo);
-      }
 
       return {
         cik: cik,
@@ -147,6 +134,47 @@ function findDocUrl(query) {
   return tryNext();
 }
 
+// ── Find the correct document in a filing index ───────────────────────────
+function findDocInIndex(filing) {
+  var indexUrl = "https://www.sec.gov/Archives/edgar/data/" + filing.cik +
+    "/" + filing.accNoDashes + "/" + filing.accNo + "-index.htm";
+
+  return get(indexUrl).then(function(r) {
+    if (r.status !== 200) throw new Error("Could not fetch filing index (HTTP " + r.status + ")");
+
+    var html = r.body;
+    var matches = html.match(/href="([^"]+\.htm)"/gi) || [];
+    var htmFiles = [];
+    for (var i = 0; i < matches.length; i++) {
+      var m = matches[i].match(/href="([^"]+\.htm)"/i);
+      if (m && m[1].indexOf("index") === -1 && m[1].indexOf("http") === -1) {
+        htmFiles.push(m[1]);
+      }
+    }
+
+    if (htmFiles.length === 0) throw new Error("No documents found in filing index: " + indexUrl);
+
+    var baseUrl = "https://www.sec.gov/Archives/edgar/data/" + filing.cik + "/" + filing.accNoDashes + "/";
+
+    function tryFile(i) {
+      if (i >= htmFiles.length) throw new Error("Could not load any document from filing index: " + indexUrl);
+      var fileUrl = htmFiles[i].startsWith("/")
+        ? "https://www.sec.gov" + htmFiles[i]
+        : baseUrl + htmFiles[i];
+
+      return get(fileUrl).then(function(r2) {
+        if (r2.status === 200 && r2.body.length > 1000) {
+          return { docUrl: fileUrl, body: r2.body, indexUrl: indexUrl };
+        }
+        return tryFile(i + 1);
+      });
+    }
+
+    return tryFile(0);
+  });
+}
+
+// ── Parse holdings from HTML ──────────────────────────────────────────────
 function parseHoldings(html) {
   function strip(s) {
     return s
@@ -187,7 +215,6 @@ function parseHoldings(html) {
     if (!valueCell) continue;
 
     var valueNum = parseInt(valueCell.replace(/[$,\s]/g, ""));
-
     var sharesCell = null;
     for (var k = 0; k < cells.length; k++) {
       var sn = cells[k].replace(/[,\s]/g, "");
@@ -218,10 +245,32 @@ function parseHoldings(html) {
   return { holdings: holdings };
 }
 
+// ── Main search handler ───────────────────────────────────────────────────
 function handleSearch(req, res, query) {
-  findDocUrl(query).then(function(filing) {
-    // Fetch index page to find the correct document
-    return findDocInIndex(filing.cik, filing.accNo, filing.accNoDashes).then(function(doc) {
+  var trimmed = query.trim();
+
+  // Decide: looks like a ticker (short, no spaces, all letters) → try ticker first
+  var looksLikeTicker = /^[A-Za-z]{1,6}$/.test(trimmed);
+
+  var filingPromise;
+
+  if (looksLikeTicker) {
+    // Try ticker lookup first, fall back to name search
+    filingPromise = lookupByTicker(trimmed).then(function(result) {
+      if (!result) {
+        // Ticker not found in list, try name search
+        return searchByName(trimmed);
+      }
+      // Got CIK, now find latest NPORT-P via submissions API
+      return getLatestNportByCik(result.cik, result.name);
+    });
+  } else {
+    // Looks like a fund name, go straight to full-text search
+    filingPromise = searchByName(trimmed);
+  }
+
+  filingPromise.then(function(filing) {
+    return findDocInIndex(filing).then(function(doc) {
       var result = parseHoldings(doc.body);
       var holdings = result.holdings;
 
@@ -234,7 +283,7 @@ function handleSearch(req, res, query) {
 
       var total = holdings.reduce(function(s, h) { return s + h.value; }, 0);
       jsonResp(res, 200, {
-        query: query,
+        query: trimmed,
         fundName: filing.entityName,
         period: filing.period,
         filingDate: filing.filingDate,
@@ -252,6 +301,7 @@ function handleSearch(req, res, query) {
   });
 }
 
+// ── Static file server ────────────────────────────────────────────────────
 function serveStatic(res, filePath) {
   var ext = path.extname(filePath);
   var types = { ".html": "text/html", ".js": "application/javascript", ".css": "text/css" };
