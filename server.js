@@ -99,7 +99,8 @@ function findDocUrl(query) {
       }
 
       // Remove leading zeros for the URL path
-      var cikNum = String(parseInt(cik, 10));
+      // Keep CIK as-is for the URL - do not strip leading zeros
+      var cikNum = cik;
 
       return {
         docUrl: "https://www.sec.gov/Archives/edgar/data/" + cikNum + "/" + accNoDashes + "/" + filename,
