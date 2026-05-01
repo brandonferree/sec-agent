@@ -41,6 +41,26 @@ function jsonResp(res, code, data) {
   res.end(body);
 }
 
+function extractCikFromHit(hit) {
+  var src = hit._source;
+
+  // Try every known field name EDGAR uses for CIK
+  var cik = src.entity_id || src.cik || src.cik_str || src.file_num || "";
+
+  // If still empty, try to extract from the accession number portion of _id
+  // _id format: "0001234567-24-001234:filename.htm"
+  // The first 10 digits of the accession number are the filer's CIK
+  if (!cik && hit._id) {
+    var accPart = hit._id.split(":")[0]; // "0001234567-24-001234"
+    var cikFromAcc = accPart.split("-")[0]; // "0001234567"
+    if (cikFromAcc && /^\d+$/.test(cikFromAcc)) {
+      cik = cikFromAcc;
+    }
+  }
+
+  return cik;
+}
+
 function findDocUrl(query) {
   var queries = ['"' + query + '"', query];
   var index = 0;
@@ -51,33 +71,48 @@ function findDocUrl(query) {
     }
     var q = queries[index++];
     var searchUrl = "https://efts.sec.gov/LATEST/search-index?q=" + encodeURIComponent(q) + "&forms=NPORT-P&dateRange=custom&startdt=2023-01-01&enddt=2026-12-31";
+
     return get(searchUrl).then(function(r) {
-      if (r.status === 403) throw new Error("SEC EDGAR returned 403. Update the email in server.js User-Agent.");
+      if (r.status === 403) throw new Error("SEC EDGAR returned 403. Update the email in the User-Agent in server.js.");
       if (r.status !== 200) throw new Error("EDGAR search returned HTTP " + r.status + ": " + r.body.slice(0, 80));
       if (!r.ct.includes("json")) throw new Error("EDGAR returned unexpected response: " + r.body.slice(0, 80));
+
       var data = JSON.parse(r.body);
       var hits = data.hits && data.hits.hits;
       if (!hits || hits.length === 0) return tryNext();
+
       var hit = hits[0];
       var src = hit._source;
-      var parts = hit._id.split(":");
-      var accNo = parts[0];
-      var filename = parts[1];
+
+      // _id format: "0001234567-24-001234:filename.htm"
+      var idParts = hit._id.split(":");
+      var accNo = idParts[0];
+      var filename = idParts[1];
       if (!accNo || !filename) throw new Error("Unexpected _id format: " + hit._id);
+
       var accNoDashes = accNo.replace(/-/g, "");
-      var cik = src.entity_id || src.cik || "";
-      if (!cik) throw new Error("Could not determine CIK from search result");
+      var cik = extractCikFromHit(hit);
+
+      if (!cik) {
+        // Log what we got so we can debug
+        throw new Error("Could not determine CIK. Hit _id: " + hit._id + " | _source keys: " + Object.keys(src).join(", "));
+      }
+
+      // Remove leading zeros for the URL path
+      var cikNum = String(parseInt(cik, 10));
+
       return {
-        docUrl: "https://www.sec.gov/Archives/edgar/data/" + cik + "/" + accNoDashes + "/" + filename,
-        indexUrl: "https://www.sec.gov/Archives/edgar/data/" + cik + "/" + accNoDashes + "/" + accNo + "-index.htm",
+        docUrl: "https://www.sec.gov/Archives/edgar/data/" + cikNum + "/" + accNoDashes + "/" + filename,
+        indexUrl: "https://www.sec.gov/Archives/edgar/data/" + cikNum + "/" + accNoDashes + "/" + accNo + "-index.htm",
         period: src.period_of_report,
         filingDate: src.file_date,
         entityName: src.entity_name,
-        cik: cik,
+        cik: cikNum,
         accNo: accNo
       };
     });
   }
+
   return tryNext();
 }
 
@@ -96,36 +131,52 @@ function parseHoldings(html) {
       .replace(/&#160;/g, " ").replace(/&nbsp;/g, " ").replace(/&#[0-9]+;/g, "")
       .replace(/\s+/g, " ").trim();
   }
+
   var inThousands = /in thousands/i.test(html);
   var holdings = [];
   var seen = {};
   var sector = null;
   var rows = html.match(/<tr[\s\S]*?<\/tr>/gi) || [];
+
   for (var i = 0; i < rows.length; i++) {
     var cellMatches = rows[i].match(/<t[dh][^>]*>([\s\S]*?)<\/t[dh]>/gi) || [];
     var cells = cellMatches.map(function(c) {
       return strip(c.replace(/<t[dh][^>]*>/i, "").replace(/<\/t[dh]>/i, ""));
     });
+
     if (cells.length < 2) continue;
     var full = cells.join(" ").trim();
+
+    // Detect sector header rows
     var sh = full.match(/^([A-Z][A-Za-z ,&\/()\-]+?)\s*[:\-]+\s*[\d.]+\s*%/);
     if (sh && !cells.some(function(c) { return /^\$?[\d]{1,3}(,\d{3})+$/.test(c.trim()); })) {
       sector = sh[1].trim();
       continue;
     }
+
+    // Skip total rows
     if (/^TOTAL\b|^Grand Total|^Common Stocks|^Shares$|^Value$/i.test(full.trim())) continue;
+
+    // Find value cell
     var valueCell = null;
     for (var j = 0; j < cells.length; j++) {
       var n = cells[j].replace(/[$,\s]/g, "");
       if (/^\d{4,}$/.test(n) && parseInt(n) > 100) { valueCell = cells[j]; break; }
     }
     if (!valueCell) continue;
+
     var valueNum = parseInt(valueCell.replace(/[$,\s]/g, ""));
+
+    // Find shares cell
     var sharesCell = null;
     for (var k = 0; k < cells.length; k++) {
       var sn = cells[k].replace(/[,\s]/g, "");
-      if (/^\d+$/.test(sn) && sn !== valueCell.replace(/[$,\s]/g,"") && parseInt(sn) > 0) { sharesCell = cells[k]; break; }
+      if (/^\d+$/.test(sn) && sn !== valueCell.replace(/[$,\s]/g, "") && parseInt(sn) > 0) {
+        sharesCell = cells[k]; break;
+      }
     }
+
+    // Find name cell (longest non-numeric cell)
     var nameCell = null;
     var maxLen = 0;
     for (var m = 0; m < cells.length; m++) {
@@ -135,13 +186,16 @@ function parseHoldings(html) {
       }
     }
     if (!nameCell) continue;
+
     var value = inThousands ? valueNum * 1000 : valueNum;
     var shares = sharesCell ? parseInt(sharesCell.replace(/,/g, "")) : null;
     var name = nameCell.replace(/\s*\([a-z,\/]\)\s*/gi, "").replace(/\s+/g, " ").trim();
+
     if (!name || value <= 0 || seen[name]) continue;
     seen[name] = true;
     holdings.push({ name: name, sector: sector, shares: shares, value: value });
   }
+
   return { holdings: holdings };
 }
 
@@ -150,9 +204,14 @@ function handleSearch(req, res, query) {
     return fetchDoc(filing.docUrl).then(function(html) {
       var result = parseHoldings(html);
       var holdings = result.holdings;
+
       if (holdings.length < 3) {
-        return jsonResp(res, 422, { error: "Only parsed " + holdings.length + " holdings.", docUrl: filing.docUrl });
+        return jsonResp(res, 422, {
+          error: "Only parsed " + holdings.length + " holdings. The document format may be unsupported.",
+          docUrl: filing.docUrl
+        });
       }
+
       var total = holdings.reduce(function(s, h) { return s + h.value; }, 0);
       jsonResp(res, 200, {
         query: query,
