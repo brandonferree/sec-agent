@@ -1,1 +1,283 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>SEC Holdings Agent</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@600&family=Instrument+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap');
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0f0e0d;--bg2:#1a1916;--bg3:#242220;
+  --border:rgba(255,255,255,.07);--border2:rgba(255,255,255,.12);
+  --text:#e8e5df;--text2:#9a9690;--text3:#5a5650;
+  --gold:#c9a84c;--green:#4caf7d;--red:#e05252;--r:8px;
+}
+body{font-family:'Instrument Sans',sans-serif;background:var(--bg);color:var(--text);min-height:100vh}
+.shell{max-width:1100px;margin:0 auto;padding:2rem 1.5rem}
+header{display:flex;align-items:baseline;gap:14px;margin-bottom:2rem;padding-bottom:1.25rem;border-bottom:1px solid var(--border)}
+h1{font-family:'Playfair Display',serif;font-size:1.75rem;letter-spacing:-.02em}
+h1 span{color:var(--gold)}
+.badge{font-family:'JetBrains Mono',monospace;font-size:.6rem;color:var(--text3);background:var(--bg3);border:1px solid var(--border);padding:3px 8px;border-radius:99px;letter-spacing:.1em;text-transform:uppercase}
+.card{background:var(--bg2);border:1px solid var(--border);border-radius:var(--r);padding:1.25rem;margin-bottom:1rem}
+.search-row{display:flex;gap:8px;margin-bottom:10px}
+.search-row input{flex:1;padding:11px 14px;background:var(--bg3);border:1px solid var(--border2);border-radius:6px;color:var(--text);font-family:'Instrument Sans',sans-serif;font-size:14px;outline:none;transition:border-color .15s}
+.search-row input:focus{border-color:var(--gold)}
+.search-row input::placeholder{color:var(--text3)}
+.go-btn{padding:11px 22px;background:var(--gold);color:#0f0e0d;border:none;border-radius:6px;font-family:'Instrument Sans',sans-serif;font-size:14px;font-weight:600;cursor:pointer;white-space:nowrap;transition:opacity .15s}
+.go-btn:hover{opacity:.88}
+.go-btn:disabled{opacity:.35;cursor:not-allowed}
+.suggs{display:flex;flex-wrap:wrap;gap:6px}
+.sugg{padding:5px 12px;background:var(--bg3);border:1px solid var(--border);border-radius:99px;color:var(--text2);font-size:12px;cursor:pointer;transition:all .12s}
+.sugg:hover{border-color:var(--gold);color:var(--gold)}
+.prog{display:none}
+.step{display:flex;align-items:center;gap:10px;font-size:13px;color:var(--text2);padding:4px 0}
+.dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.dot.spin{border:2px solid var(--gold);border-right-color:transparent;animation:spin .7s linear infinite;background:transparent}
+.dot.ok{background:var(--green)}
+.dot.err{background:var(--red)}
+@keyframes spin{to{transform:rotate(360deg)}}
+.err-box{background:rgba(224,82,82,.1);border:1px solid rgba(224,82,82,.3);border-radius:var(--r);padding:1rem 1.25rem;color:var(--red);font-size:13px;line-height:1.7;margin-bottom:1rem;display:none}
+.err-box code{font-family:'JetBrains Mono',monospace;font-size:11px;opacity:.8}
+.fund-name{font-family:'Playfair Display',serif;font-size:1.3rem;margin-bottom:4px}
+.fund-sub{font-size:12px;color:var(--text2);line-height:1.9}
+.fund-sub a{color:var(--gold);text-decoration:none}
+.stats-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px;margin-top:12px}
+.stat{background:var(--bg3);border-radius:6px;padding:10px 14px}
+.stat-l{font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px}
+.stat-v{font-size:1.25rem;font-weight:600;font-family:'JetBrains Mono',monospace}
+.controls{display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap;align-items:center}
+.ctrl-in,.ctrl-sel{padding:7px 11px;background:var(--bg3);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:'Instrument Sans',sans-serif;font-size:12px;outline:none}
+.ctrl-in{flex:1;min-width:160px}
+.ctrl-in::placeholder{color:var(--text3)}
+.ctrl-in:focus,.ctrl-sel:focus{border-color:var(--gold)}
+.tab-btn{padding:6px 14px;border:1px solid var(--border);border-radius:6px;background:var(--bg3);color:var(--text2);font-family:'Instrument Sans',sans-serif;font-size:12px;cursor:pointer;transition:all .12s}
+.tab-btn.active{background:var(--gold);color:#0f0e0d;border-color:var(--gold);font-weight:600}
+.dl-btn{padding:6px 14px;border:1px solid var(--border);border-radius:6px;background:transparent;color:var(--text2);font-family:'Instrument Sans',sans-serif;font-size:12px;cursor:pointer;margin-left:auto}
+.dl-btn:hover{color:var(--text);border-color:var(--border2)}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{text-align:left;padding:7px 10px;border-bottom:1px solid var(--border);font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.05em;cursor:pointer;user-select:none;white-space:nowrap;font-weight:500}
+th:hover{color:var(--text2)}
+th.sorted{color:var(--gold)}
+td{padding:7px 10px;border-bottom:1px solid rgba(255,255,255,.03);vertical-align:middle}
+tr:hover td{background:rgba(255,255,255,.02)}
+tr:last-child td{border-bottom:none}
+.mono{font-family:'JetBrains Mono',monospace;font-size:11px}
+.pill{font-size:10px;padding:2px 8px;border-radius:99px;font-weight:500;white-space:nowrap}
+.bar{display:inline-block;height:3px;border-radius:2px;vertical-align:middle;margin-right:5px}
+.tbl-note{font-size:11px;color:var(--text3);margin-top:8px}
+.sg{display:grid;grid-template-columns:repeat(auto-fill,minmax(155px,1fr));gap:8px}
+.sc{background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:12px}
+.sc-n{font-size:11px;color:var(--text2);margin-bottom:4px}
+.sc-p{font-size:1.3rem;font-weight:600;font-family:'JetBrains Mono',monospace}
+.sc-s{font-size:10px;color:var(--text3);margin-top:2px}
+.sc-t{height:2px;background:var(--bg2);border-radius:2px;margin-top:8px;overflow:hidden}
+.sc-f{height:100%;border-radius:2px}
+.chat-lbl{font-size:10px;font-weight:600;color:var(--text3);text-transform:uppercase;letter-spacing:.08em;margin-bottom:12px}
+.chat-msgs{margin-bottom:10px}
+.cmsg{padding:10px 14px;border-radius:6px;margin-bottom:8px;font-size:13px;line-height:1.6}
+.cmsg.user{background:rgba(201,168,76,.1);border:1px solid rgba(201,168,76,.2);max-width:85%;margin-left:auto}
+.cmsg.agent{background:var(--bg3);border:1px solid var(--border);white-space:pre-wrap}
+.cmsg.thinking{color:var(--text3);font-style:italic}
+.chat-row{display:flex;gap:8px}
+.chat-row input{flex:1;padding:9px 13px;background:var(--bg3);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:'Instrument Sans',sans-serif;font-size:13px;outline:none}
+.chat-row input:focus{border-color:var(--gold)}
+.chat-row input::placeholder{color:var(--text3)}
+.ask-btn{padding:9px 18px;background:var(--bg3);border:1px solid var(--border2);border-radius:6px;color:var(--text2);font-family:'Instrument Sans',sans-serif;font-size:13px;cursor:pointer}
+.ask-btn:hover{color:var(--text);border-color:var(--gold)}
+.ask-btn:disabled{opacity:.4;cursor:not-allowed}
+#view-s{display:none}
+#results{display:none}
+</style>
+</head>
+<body>
+<div class="shell">
 
+<header>
+  <h1>SEC Holdings <span>Agent</span></h1>
+  <span class="badge">Live EDGAR · NPORT-P</span>
+</header>
+
+<div class="card">
+  <div class="search-row">
+    <input id="q" type="text" placeholder="Any fund name or ticker… e.g. Fidelity Contrafund, Dodge Cox Stock Fund, Oakmark Fund"/>
+    <button class="go-btn" id="go" onclick="run()">Search SEC →</button>
+  </div>
+  <div class="suggs">
+    <span class="sugg" onclick="qs('Becker Value Equity Fund')">Becker Value Equity</span>
+    <span class="sugg" onclick="qs('Fidelity Contrafund')">Fidelity Contrafund</span>
+    <span class="sugg" onclick="qs('Dodge Cox Stock Fund')">Dodge &amp; Cox Stock</span>
+    <span class="sugg" onclick="qs('Oakmark Fund')">Oakmark</span>
+    <span class="sugg" onclick="qs('American Funds Growth Fund of America')">American Funds Growth</span>
+    <span class="sugg" onclick="qs('Vanguard Wellington Fund')">Vanguard Wellington</span>
+    <span class="sugg" onclick="qs('T Rowe Price Blue Chip Growth Fund')">T. Rowe Blue Chip</span>
+  </div>
+</div>
+
+<div class="card prog" id="prog">
+  <div id="steps"></div>
+</div>
+
+<div class="err-box" id="err"></div>
+
+<div id="results">
+
+  <div class="card" id="meta-card"></div>
+
+  <div class="card">
+    <div class="controls">
+      <input class="ctrl-in" id="fi" type="text" placeholder="Filter by name or sector…" oninput="render()"/>
+      <select class="ctrl-sel" id="sf" onchange="render()"><option value="">All sectors</option></select>
+      <button class="tab-btn active" id="tab-h" onclick="showTab('h')">Holdings</button>
+      <button class="tab-btn" id="tab-s" onclick="showTab('s')">Sectors</button>
+      <button class="dl-btn" onclick="dlCSV()">↓ CSV</button>
+    </div>
+    <div id="view-h">
+      <table>
+        <thead><tr>
+          <th onclick="srt('rank')" id="th-rank">#</th>
+          <th onclick="srt('name')" id="th-name">Security</th>
+          <th onclick="srt('sector')" id="th-sector">Sector</th>
+          <th onclick="srt('shares')" id="th-shares" style="text-align:right">Shares</th>
+          <th onclick="srt('value')" id="th-value" style="text-align:right">Value</th>
+          <th onclick="srt('pct')" id="th-pct" style="text-align:right">Weight</th>
+        </tr></thead>
+        <tbody id="tbody"></tbody>
+      </table>
+      <div class="tbl-note" id="note"></div>
+    </div>
+    <div id="view-s"><div class="sg" id="sg"></div></div>
+  </div>
+
+  <div class="card">
+    <div class="chat-lbl">Ask AI about these holdings</div>
+    <div class="chat-msgs" id="msgs"></div>
+    <div class="chat-row">
+      <input type="text" id="qi" placeholder="Largest position? Top sector? Total financials exposure?" onkeydown="if(event.key==='Enter')ask()"/>
+      <button class="ask-btn" id="qb" onclick="ask()">Ask →</button>
+    </div>
+  </div>
+
+</div>
+</div>
+
+<script>
+let H=[],M={},CH=[],SC='value',SD=-1;
+const COLORS={'Financials':'#8b5cf6','Financial Services':'#8b5cf6','Banks':'#7c3aed','Insurance':'#a78bfa','Communication Services':'#3b82f6','Media & Entertainment':'#2563eb','Information Technology':'#f97316','Software':'#ef4444','Consumer Discretionary':'#f59e0b','Consumer Staples':'#22c55e','Health Care':'#06b6d4','Healthcare':'#06b6d4','Industrials':'#94a3b8','Energy':'#f87171','Materials':'#a8a29e','Real Estate':'#d97706','Utilities':'#4ade80','Short-Term':'#64748b'};
+const col=s=>COLORS[s]||'#64748b';
+const fmtV=v=>v>=1e9?`$${(v/1e9).toFixed(2)}B`:v>=1e6?`$${(v/1e6).toFixed(1)}M`:`$${(v/1e3).toFixed(0)}K`;
+
+const SE={};
+function addStep(id,txt){const w=document.getElementById('steps');const d=document.createElement('div');d.className='step';const dot=document.createElement('div');dot.className='dot spin';const sp=document.createElement('span');sp.textContent=txt;d.appendChild(dot);d.appendChild(sp);w.appendChild(d);SE[id]={dot,sp};}
+function okStep(id,txt){if(SE[id]){SE[id].dot.className='dot ok';if(txt)SE[id].sp.textContent=txt;}}
+function errStep(id,txt){if(SE[id]){SE[id].dot.className='dot err';if(txt)SE[id].sp.textContent=txt;}}
+
+function qs(t){document.getElementById('q').value=t;run();}
+document.getElementById('q').addEventListener('keydown',e=>{if(e.key==='Enter')run();});
+
+async function run(){
+  const q=document.getElementById('q').value.trim();
+  if(!q)return;
+  document.getElementById('go').disabled=true;
+  document.getElementById('steps').innerHTML='';
+  Object.keys(SE).forEach(k=>delete SE[k]);
+  document.getElementById('prog').style.display='block';
+  document.getElementById('err').style.display='none';
+  document.getElementById('results').style.display='none';
+  document.getElementById('msgs').innerHTML='';
+  H=[];M={};CH=[];
+
+  try{
+    addStep('s',`Searching SEC EDGAR for "${q}"…`);
+    const res=await fetch(`/api/search?q=${encodeURIComponent(q)}`);
+
+    // Guard against non-JSON response (server error pages etc)
+    const ct=res.headers.get('content-type')||'';
+    if(!ct.includes('json')){
+      const text=await res.text();
+      throw new Error(`Server returned unexpected response: ${text.slice(0,120)}`);
+    }
+
+    const data=await res.json();
+    if(!res.ok||data.error){
+      errStep('s',data.error||'Search failed');
+      const eb=document.getElementById('err');
+      eb.innerHTML=`<strong>⚠ ${data.error||'Search failed'}</strong>${data.hint?`<br><small>${data.hint}</small>`:''}${data.docUrl?`<br><small>Direct URL: <a href="${data.docUrl}" target="_blank" style="color:var(--gold)">${data.docUrl}</a></small>`:''}`;
+      eb.style.display='block';
+      return;
+    }
+
+    okStep('s',`Found ${data.count} holdings · ${data.period}`);
+    H=data.holdings;
+    M={name:data.fundName||q,period:data.period,filed:data.filingDate,docUrl:data.docUrl,netAssets:data.netAssets};
+    renderMeta();renderSectorFilter();render();renderSectors();
+    document.getElementById('results').style.display='block';
+  }catch(err){
+    const last=Object.keys(SE).pop();
+    if(last)errStep(last,err.message);
+    const eb=document.getElementById('err');
+    eb.innerHTML=`<strong>⚠ ${err.message}</strong>`;
+    eb.style.display='block';
+  }
+  document.getElementById('go').disabled=false;
+}
+
+function renderMeta(){
+  const tvF=fmtV(M.netAssets);
+  const secs=[...new Set(H.map(h=>h.sector).filter(Boolean))].length;
+  document.getElementById('meta-card').innerHTML=`<div class="fund-name">${M.name}</div><div class="fund-sub">NPORT-P · Period: <strong>${M.period||'—'}</strong> · Filed: ${M.filed||'—'} · ${H.length} positions · ~${tvF} net assets · ${secs} sectors · <a href="${M.docUrl}" target="_blank">SEC EDGAR ↗</a></div><div class="stats-row"><div class="stat"><div class="stat-l">Positions</div><div class="stat-v">${H.length}</div></div><div class="stat"><div class="stat-l">Net Assets</div><div class="stat-v">${tvF}</div></div><div class="stat"><div class="stat-l">Sectors</div><div class="stat-v">${secs}</div></div><div class="stat"><div class="stat-l">Largest</div><div class="stat-v">${fmtV(Math.max(...H.map(h=>h.value)))}</div></div></div>`;
+}
+
+function renderSectorFilter(){
+  const secs=[...new Set(H.map(h=>h.sector).filter(Boolean))].sort();
+  document.getElementById('sf').innerHTML='<option value="">All sectors</option>'+secs.map(s=>`<option value="${s}">${s}</option>`).join('');
+}
+
+function srt(c){document.querySelectorAll('th').forEach(t=>t.classList.remove('sorted'));if(SC===c)SD*=-1;else{SC=c;SD=-1;}document.getElementById('th-'+c)?.classList.add('sorted');render();}
+
+function render(){
+  const q=document.getElementById('fi').value.toLowerCase(),sf=document.getElementById('sf').value;
+  let data=H.map((h,i)=>({...h,rank:i+1}));
+  if(q)data=data.filter(h=>(h.name||'').toLowerCase().includes(q)||(h.sector||'').toLowerCase().includes(q));
+  if(sf)data=data.filter(h=>h.sector===sf);
+  data.sort((a,b)=>{const av=a[SC]??-Infinity,bv=b[SC]??-Infinity;return typeof av==='string'?SD*av.localeCompare(bv):SD*(av-bv);});
+  const mx=Math.max(...data.map(h=>h.value||0),1);
+  document.getElementById('tbody').innerHTML=data.map((h,i)=>{const c=col(h.sector),bw=Math.max(2,Math.round(h.value/mx*60));return`<tr><td style="color:var(--text3);width:28px">${i+1}</td><td style="font-weight:500">${h.name}</td><td><span class="pill" style="background:${c}22;color:${c}">${h.sector||'—'}</span></td><td class="mono" style="text-align:right;color:var(--text2)">${h.shares?h.shares.toLocaleString():'—'}</td><td class="mono" style="text-align:right"><span class="bar" style="width:${bw}px;background:${c}"></span>${fmtV(h.value)}</td><td class="mono" style="text-align:right">${h.pct.toFixed(2)}%</td></tr>`;}).join('');
+  document.getElementById('note').textContent=`${data.length} of ${H.length} holdings`;
+}
+
+function renderSectors(){
+  const byS={};H.forEach(h=>{const s=h.sector||'Other';if(!byS[s])byS[s]={value:0,count:0};byS[s].value+=h.value;byS[s].count++;});
+  const tot=Object.values(byS).reduce((s,d)=>s+d.value,0);
+  const sorted=Object.entries(byS).sort((a,b)=>b[1].value-a[1].value);
+  const maxP=sorted[0][1].value/tot*100;
+  document.getElementById('sg').innerHTML=sorted.map(([name,d])=>{const pct=(d.value/tot*100).toFixed(1),c=col(name),vf=fmtV(d.value),bw=Math.round(d.value/tot*100/maxP*100);return`<div class="sc"><div class="sc-n">${name}</div><div class="sc-p" style="color:${c}">${pct}%</div><div class="sc-s">${vf} · ${d.count} pos</div><div class="sc-t"><div class="sc-f" style="width:${bw}%;background:${c}"></div></div></div>`;}).join('');
+}
+
+function showTab(t){document.getElementById('view-h').style.display=t==='h'?'block':'none';document.getElementById('view-s').style.display=t==='s'?'block':'none';document.getElementById('tab-h').classList.toggle('active',t==='h');document.getElementById('tab-s').classList.toggle('active',t==='s');}
+
+function dlCSV(){const rows=[['#','Name','Sector','Shares','Value (USD)','Weight (%)']];H.forEach((h,i)=>rows.push([i+1,`"${h.name.replace(/"/g,'""')}"`,`"${h.sector||''}"`,h.shares||'',h.value,h.pct.toFixed(4)]));const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([rows.map(r=>r.join(',')).join('\n')],{type:'text/csv'}));a.download=`${M.name.replace(/\s+/g,'_')}_${M.period}.csv`;a.click();}
+
+async function ask(){
+  const q=document.getElementById('qi').value.trim();if(!q||!H.length)return;
+  document.getElementById('qi').value='';document.getElementById('qb').disabled=true;
+  const msgs=document.getElementById('msgs');
+  const u=document.createElement('div');u.className='cmsg user';u.textContent=q;msgs.appendChild(u);
+  const t=document.createElement('div');t.className='cmsg thinking';t.textContent='Analyzing…';msgs.appendChild(t);
+  t.scrollIntoView({behavior:'smooth',block:'end'});
+  const summary=H.map(h=>`${h.name}|${h.sector}|${h.shares?.toLocaleString()||'N/A'}|${fmtV(h.value)}|${h.pct.toFixed(2)}%`).join('\n');
+  const ctx=CH.length===0?`Holdings for ${M.name}, period ${M.period}:\n${summary}\n\nQuestion: ${q}`:q;
+  const apiMsgs=CH.length===0?[{role:'user',content:ctx}]:[...CH,{role:'user',content:q}];
+  try{
+    const r=await fetch('https://api.anthropic.com/v1/messages',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:'claude-sonnet-4-20250514',max_tokens:1024,system:`Portfolio analyst for ${M.name}. Answer concisely with specific numbers. Format dollars as $XB or $XM.`,messages:apiMsgs})});
+    const d=await r.json();
+    const reply=d.content.filter(b=>b.type==='text').map(b=>b.text).join('');
+    t.className='cmsg agent';t.textContent=reply;
+    CH.push({role:'user',content:ctx});CH.push({role:'assistant',content:reply});
+  }catch(e){t.className='cmsg agent';t.textContent='Error: '+e.message;}
+  document.getElementById('qb').disabled=false;
+  t.scrollIntoView({behavior:'smooth',block:'end'});
+}
+</script>
+</body>
+</html>
