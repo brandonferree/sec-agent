@@ -41,26 +41,6 @@ function jsonResp(res, code, data) {
   res.end(body);
 }
 
-function extractCikFromHit(hit) {
-  var src = hit._source;
-
-  // Try every known field name EDGAR uses for CIK
-  var cik = src.entity_id || src.cik || src.cik_str || src.file_num || "";
-
-  // If still empty, try to extract from the accession number portion of _id
-  // _id format: "0001234567-24-001234:filename.htm"
-  // The first 10 digits of the accession number are the filer's CIK
-  if (!cik && hit._id) {
-    var accPart = hit._id.split(":")[0]; // "0001234567-24-001234"
-    var cikFromAcc = accPart.split("-")[0]; // "0001234567"
-    if (cikFromAcc && /^\d+$/.test(cikFromAcc)) {
-      cik = cikFromAcc;
-    }
-  }
-
-  return cik;
-}
-
 function findDocUrl(query) {
   var queries = ['"' + query + '"', query];
   var index = 0;
@@ -73,7 +53,7 @@ function findDocUrl(query) {
     var searchUrl = "https://efts.sec.gov/LATEST/search-index?q=" + encodeURIComponent(q) + "&forms=NPORT-P&dateRange=custom&startdt=2023-01-01&enddt=2026-12-31";
 
     return get(searchUrl).then(function(r) {
-      if (r.status === 403) throw new Error("SEC EDGAR returned 403. Update the email in the User-Agent in server.js.");
+      if (r.status === 403) throw new Error("SEC EDGAR returned 403. Update YOUR_EMAIL_HERE in server.js.");
       if (r.status !== 200) throw new Error("EDGAR search returned HTTP " + r.status + ": " + r.body.slice(0, 80));
       if (!r.ct.includes("json")) throw new Error("EDGAR returned unexpected response: " + r.body.slice(0, 80));
 
@@ -91,24 +71,22 @@ function findDocUrl(query) {
       if (!accNo || !filename) throw new Error("Unexpected _id format: " + hit._id);
 
       var accNoDashes = accNo.replace(/-/g, "");
-      var cik = extractCikFromHit(hit);
 
-      if (!cik) {
-        // Log what we got so we can debug
-        throw new Error("Could not determine CIK. Hit _id: " + hit._id + " | _source keys: " + Object.keys(src).join(", "));
+      // The CIK is ALWAYS the first 10 digits of the accession number
+      // e.g. "0000811030-24-059987" -> CIK is "0000811030"
+      // This is more reliable than any _source field
+      var cik = accNo.split("-")[0];
+      if (!cik || !/^\d+$/.test(cik)) {
+        throw new Error("Could not extract CIK from accession number: " + accNo);
       }
 
-      // Remove leading zeros for the URL path
-      // Keep CIK as-is for the URL - do not strip leading zeros
-      var cikNum = cik;
-
       return {
-        docUrl: "https://www.sec.gov/Archives/edgar/data/" + cikNum + "/" + accNoDashes + "/" + filename,
-        indexUrl: "https://www.sec.gov/Archives/edgar/data/" + cikNum + "/" + accNoDashes + "/" + accNo + "-index.htm",
+        docUrl: "https://www.sec.gov/Archives/edgar/data/" + cik + "/" + accNoDashes + "/" + filename,
+        indexUrl: "https://www.sec.gov/Archives/edgar/data/" + cik + "/" + accNoDashes + "/" + accNo + "-index.htm",
         period: src.period_of_report,
         filingDate: src.file_date,
         entityName: src.entity_name,
-        cik: cikNum,
+        cik: cik,
         accNo: accNo
       };
     });
@@ -148,17 +126,14 @@ function parseHoldings(html) {
     if (cells.length < 2) continue;
     var full = cells.join(" ").trim();
 
-    // Detect sector header rows
     var sh = full.match(/^([A-Z][A-Za-z ,&\/()\-]+?)\s*[:\-]+\s*[\d.]+\s*%/);
     if (sh && !cells.some(function(c) { return /^\$?[\d]{1,3}(,\d{3})+$/.test(c.trim()); })) {
       sector = sh[1].trim();
       continue;
     }
 
-    // Skip total rows
     if (/^TOTAL\b|^Grand Total|^Common Stocks|^Shares$|^Value$/i.test(full.trim())) continue;
 
-    // Find value cell
     var valueCell = null;
     for (var j = 0; j < cells.length; j++) {
       var n = cells[j].replace(/[$,\s]/g, "");
@@ -168,7 +143,6 @@ function parseHoldings(html) {
 
     var valueNum = parseInt(valueCell.replace(/[$,\s]/g, ""));
 
-    // Find shares cell
     var sharesCell = null;
     for (var k = 0; k < cells.length; k++) {
       var sn = cells[k].replace(/[,\s]/g, "");
@@ -177,7 +151,6 @@ function parseHoldings(html) {
       }
     }
 
-    // Find name cell (longest non-numeric cell)
     var nameCell = null;
     var maxLen = 0;
     for (var m = 0; m < cells.length; m++) {
