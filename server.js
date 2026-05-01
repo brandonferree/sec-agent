@@ -6,7 +6,7 @@ const url   = require("url");
 
 const PORT = process.env.PORT || 3000;
 
-// ── In-memory cache for ticker lists ─────────────────────────────────────
+// ── In-memory cache ───────────────────────────────────────────────────────
 var tickerCache = { mf: null, stocks: null };
 
 function get(href) {
@@ -44,7 +44,7 @@ function jsonResp(res, code, data) {
   res.end(body);
 }
 
-// ── Fetch and cache ticker lists ──────────────────────────────────────────
+// ── Ticker list caching ───────────────────────────────────────────────────
 function getMfTickers() {
   if (tickerCache.mf) return Promise.resolve(tickerCache.mf);
   console.log("Fetching mutual fund ticker list...");
@@ -52,7 +52,7 @@ function getMfTickers() {
     if (r.status === 429) throw new Error("SEC rate limit. Please wait a moment and try again.");
     if (r.status !== 200) throw new Error("Could not fetch mutual fund ticker list (HTTP " + r.status + ")");
     var data = JSON.parse(r.body);
-    // Format: { fields: ["cik","seriesId","classId","symbol"], data: [[cik,seriesId,classId,symbol],...] }
+    // fields: ["cik", "seriesId", "classId", "symbol"]
     tickerCache.mf = data.data || [];
     console.log("Cached " + tickerCache.mf.length + " mutual fund tickers.");
     return tickerCache.mf;
@@ -61,41 +61,34 @@ function getMfTickers() {
 
 function getStockTickers() {
   if (tickerCache.stocks) return Promise.resolve(tickerCache.stocks);
-  console.log("Fetching stock ticker list...");
   return get("https://www.sec.gov/files/company_tickers.json").then(function(r) {
-    if (r.status === 429) throw new Error("SEC rate limit. Please wait a moment and try again.");
     if (r.status !== 200) return [];
     var data = JSON.parse(r.body);
     tickerCache.stocks = Object.values(data);
-    console.log("Cached " + tickerCache.stocks.length + " stock tickers.");
     return tickerCache.stocks;
   });
 }
 
-// ── Ticker → CIK + Series ID ──────────────────────────────────────────────
-// Returns { cik, seriesId, classId, ticker, name }
-// seriesId (e.g. "S000005726") is the key — it uniquely identifies one fund
-// within a trust that may contain many funds
+// ── Ticker → fund info ────────────────────────────────────────────────────
+// Returns { cik, seriesId, classId, ticker, fundName }
+// seriesId is used to find the exact fund document in a multi-fund trust
 function lookupByTicker(ticker) {
   var upper = ticker.toUpperCase().trim();
-
   return getMfTickers().then(function(rows) {
-    // row = [cik, seriesId, classId, symbol]
     for (var i = 0; i < rows.length; i++) {
       if (rows[i][3] && rows[i][3].toUpperCase() === upper) {
         return {
           cik:      String(rows[i][0]).padStart(10, "0"),
-          seriesId: rows[i][1], // e.g. "S000005726"
-          classId:  rows[i][2], // e.g. "C000015507"
+          seriesId: rows[i][1],  // e.g. "S000034396"
+          classId:  rows[i][2],  // e.g. "C000106285"
           ticker:   upper,
-          name:     upper
+          fundName: null  // we'll resolve this from the fund name search
         };
       }
     }
     return null;
   }).then(function(result) {
     if (result) return result;
-    // Fallback: stock/ETF tickers (no series ID for these)
     return getStockTickers().then(function(entries) {
       for (var i = 0; i < entries.length; i++) {
         if (entries[i].ticker && entries[i].ticker.toUpperCase() === upper) {
@@ -103,7 +96,7 @@ function lookupByTicker(ticker) {
             cik:      String(entries[i].cik_str).padStart(10, "0"),
             seriesId: null,
             ticker:   upper,
-            name:     entries[i].title
+            fundName: entries[i].title
           };
         }
       }
@@ -112,64 +105,24 @@ function lookupByTicker(ticker) {
   });
 }
 
-// ── Find NPORT-P filing by Series ID (most precise) ───────────────────────
-// This ensures we get the document for THIS specific fund, not the whole trust
-function findFilingBySeriesId(seriesId, cik) {
-  // Search EDGAR full-text for NPORT-P filings filtered by this series ID
-  var searchUrl = "https://efts.sec.gov/LATEST/search-index?q=" +
-    encodeURIComponent('"' + seriesId + '"') +
-    "&forms=NPORT-P&dateRange=custom&startdt=2024-01-01&enddt=2026-12-31";
-
-  return get(searchUrl).then(function(r) {
-    if (r.status !== 200) throw new Error("EDGAR series search returned HTTP " + r.status);
-    var data = JSON.parse(r.body);
-    var hits = data.hits && data.hits.hits;
-    if (!hits || hits.length === 0) {
-      // Fall back to submissions API without series filter
-      return findFilingByCik(cik, null);
-    }
-
-    // Pick the most recent hit
-    var hit   = hits[0];
-    var src   = hit._source;
-    var accNo = hit._id.split(":")[0];
-
-    return {
-      cik:         accNo.split("-")[0],
-      accNo:       accNo,
-      accNoDashes: accNo.replace(/-/g, ""),
-      period:      src.period_of_report,
-      filingDate:  src.file_date,
-      entityName:  src.entity_name,
-      seriesId:    seriesId
-    };
-  });
-}
-
-// ── Find NPORT-P filing by CIK (submissions API) ──────────────────────────
-function findFilingByCik(cik, name) {
+// ── CIK → latest NPORT-P (submissions API) ────────────────────────────────
+function getLatestNportByCik(cik, fundName) {
   return get("https://data.sec.gov/submissions/CIK" + cik + ".json").then(function(r) {
     if (r.status !== 200) throw new Error("Could not fetch filings for CIK " + cik + " (HTTP " + r.status + ")");
-    var data     = JSON.parse(r.body);
-    var filings  = data.filings && data.filings.recent;
-    if (!filings) throw new Error("No filings found for CIK " + cik);
+    var data    = JSON.parse(r.body);
+    var recent  = data.filings && data.filings.recent;
+    if (!recent) throw new Error("No filings found for CIK " + cik);
 
-    var forms      = filings.form;
-    var dates      = filings.filingDate;
-    var accessions = filings.accessionNumber;
-    var periods    = filings.periodOfReport;
-
-    for (var i = 0; i < forms.length; i++) {
-      if (forms[i] === "NPORT-P") {
-        var accNo = accessions[i];
+    for (var i = 0; i < recent.form.length; i++) {
+      if (recent.form[i] === "NPORT-P") {
+        var accNo = recent.accessionNumber[i];
         return {
           cik:         cik,
           accNo:       accNo,
           accNoDashes: accNo.replace(/-/g, ""),
-          period:      periods ? periods[i] : dates[i],
-          filingDate:  dates[i],
-          entityName:  name || data.name,
-          seriesId:    null
+          period:      recent.periodOfReport ? recent.periodOfReport[i] : recent.filingDate[i],
+          filingDate:  recent.filingDate[i],
+          entityName:  fundName || data.name
         };
       }
     }
@@ -177,7 +130,7 @@ function findFilingByCik(cik, name) {
   });
 }
 
-// ── Fund name → EDGAR full-text search ───────────────────────────────────
+// ── Fund name full-text search ────────────────────────────────────────────
 function searchByName(query) {
   var queries = ['"' + query + '"', query];
   var index   = 0;
@@ -209,20 +162,36 @@ function searchByName(query) {
         accNoDashes: accNo.replace(/-/g, ""),
         period:      src.period_of_report,
         filingDate:  src.file_date,
-        entityName:  src.entity_name,
-        seriesId:    null
+        entityName:  src.entity_name
       };
     });
   }
-
   return tryNext();
 }
 
-// ── Find the right document within a filing ───────────────────────────────
-// When seriesId is known, we scan the index for a document whose content
-// mentions the fund name or series ID, ensuring we pick the right one
-// from a multi-fund trust filing.
-function findDocInIndex(filing, fundName) {
+// ── Resolve fund name from ticker via web search ──────────────────────────
+// For multi-fund trusts we need the specific fund name (e.g. "Baron Discovery Fund")
+// to match the right document in the filing index
+function resolveFundName(ticker, seriesId) {
+  // Search EDGAR for this ticker to get the specific fund name from the filing
+  var searchUrl = "https://efts.sec.gov/LATEST/search-index?q=" + encodeURIComponent('"' + ticker + '"') +
+    "&forms=NPORT-P&dateRange=custom&startdt=2024-01-01&enddt=2026-12-31";
+
+  return get(searchUrl).then(function(r) {
+    if (r.status !== 200) return null;
+    var data = JSON.parse(r.body);
+    var hits = data.hits && data.hits.hits;
+    if (!hits || hits.length === 0) return null;
+    // Return the entity name from the most recent hit — this is the specific fund name
+    return hits[0]._source.entity_name || null;
+  }).catch(function() { return null; });
+}
+
+// ── Find correct document in filing index ─────────────────────────────────
+// For multi-fund trusts (e.g. Baron Investment Funds Trust), the filing index
+// contains one .htm file per fund. We match by looking for the fund name
+// in the first part of each document.
+function findDocInIndex(filing, targetFundName) {
   var indexUrl = "https://www.sec.gov/Archives/edgar/data/" + filing.cik +
     "/" + filing.accNoDashes + "/" + filing.accNo + "-index.htm";
 
@@ -237,61 +206,61 @@ function findDocInIndex(filing, fundName) {
         htmFiles.push(m[1]);
       }
     }
-
     if (htmFiles.length === 0) throw new Error("No documents found in filing index: " + indexUrl);
 
     var baseUrl = "https://www.sec.gov/Archives/edgar/data/" + filing.cik + "/" + filing.accNoDashes + "/";
 
-    // If only one document, just return it
+    // If only one document, just use it
     if (htmFiles.length === 1) {
-      var onlyUrl = htmFiles[0].startsWith("/")
-        ? "https://www.sec.gov" + htmFiles[0]
-        : baseUrl + htmFiles[0];
+      var onlyUrl = htmFiles[0].startsWith("/") ? "https://www.sec.gov" + htmFiles[0] : baseUrl + htmFiles[0];
       return get(onlyUrl).then(function(r2) {
         return { docUrl: onlyUrl, body: r2.body, indexUrl: indexUrl };
       });
     }
 
-    // Multiple documents: fetch each and find the one matching this fund
-    // We look for the document whose first ~2000 chars mention the fund name or seriesId
-    var seriesId = filing.seriesId || "";
-    var ticker   = (filing.ticker || "").toUpperCase();
+    // Multiple documents — fetch each and find the one matching our fund name
+    // We only need to read the first ~1500 chars of each to find the fund header
+    var searchName = (targetFundName || "").toUpperCase();
+    // Extract key words from fund name for matching (e.g. "DISCOVERY" from "Baron Discovery Fund")
+    var keywords = searchName.split(/\s+/).filter(function(w) {
+      return w.length > 3 && ["FUND","TRUST","THE","AND"].indexOf(w) === -1;
+    });
 
-    function tryDocs(docs, i, fallback) {
-      if (i >= docs.length) {
-        // None matched specifically — return the first one that loaded
+    function tryDocs(i, fallback) {
+      if (i >= htmFiles.length) {
         if (fallback) return Promise.resolve(fallback);
-        throw new Error("Could not find the specific fund document in filing. Index: " + indexUrl);
+        throw new Error("Could not find the specific fund document. Index: " + indexUrl);
       }
 
-      var fileUrl = docs[i].startsWith("/")
-        ? "https://www.sec.gov" + docs[i]
-        : baseUrl + docs[i];
+      var fileUrl = htmFiles[i].startsWith("/")
+        ? "https://www.sec.gov" + htmFiles[i]
+        : baseUrl + htmFiles[i];
 
       return get(fileUrl).then(function(r2) {
-        if (r2.status !== 200 || r2.body.length < 500) return tryDocs(docs, i + 1, fallback);
+        if (r2.status !== 200 || r2.body.length < 500) return tryDocs(i + 1, fallback);
 
-        var preview = r2.body.slice(0, 3000).toUpperCase();
+        var doc  = { docUrl: fileUrl, body: r2.body, indexUrl: indexUrl };
+        var keep = fallback || doc; // keep first valid as fallback
 
-        // Check if this document's header matches our fund
-        var matched = false;
-        if (seriesId && preview.indexOf(seriesId.toUpperCase()) !== -1) matched = true;
-        if (ticker   && preview.indexOf(ticker) !== -1)                  matched = true;
-        if (fundName && preview.indexOf(fundName.toUpperCase().slice(0, 20)) !== -1) matched = true;
+        // Check if this document's header mentions our fund's keywords
+        var preview = r2.body.slice(0, 2000).toUpperCase();
+        var matched = keywords.length > 0 && keywords.every(function(kw) {
+          return preview.indexOf(kw) !== -1;
+        });
 
-        var doc = { docUrl: fileUrl, body: r2.body, indexUrl: indexUrl };
-        if (matched) return doc;
-
-        // Keep first valid doc as fallback
-        return tryDocs(docs, i + 1, fallback || doc);
+        if (matched) {
+          console.log("Matched fund document: " + fileUrl);
+          return doc;
+        }
+        return tryDocs(i + 1, keep);
       });
     }
 
-    return tryDocs(htmFiles, 0, null);
+    return tryDocs(0, null);
   });
 }
 
-// ── Parse holdings HTML table ─────────────────────────────────────────────
+// ── Parse holdings HTML ───────────────────────────────────────────────────
 function parseHoldings(html) {
   function strip(s) {
     return s
@@ -365,60 +334,65 @@ function handleSearch(req, res, query) {
   var trimmed         = query.trim();
   var looksLikeTicker = /^[A-Za-z]{1,6}$/.test(trimmed);
 
-  var filingPromise;
-
   if (looksLikeTicker) {
-    filingPromise = lookupByTicker(trimmed).then(function(result) {
-      if (!result) return searchByName(trimmed);
-
-      // If we have a series ID, use it to find the exact fund document
-      if (result.seriesId) {
-        return findFilingBySeriesId(result.seriesId, result.cik).then(function(filing) {
-          filing.ticker   = trimmed;
-          filing.seriesId = result.seriesId;
-          return filing;
+    lookupByTicker(trimmed).then(function(tickerInfo) {
+      if (!tickerInfo) {
+        // Not in ticker lists — try name search
+        return searchByName(trimmed).then(function(filing) {
+          return { filing: filing, fundName: filing.entityName };
         });
       }
 
-      // No series ID (ETF/stock fund) — use submissions API
-      return findFilingByCik(result.cik, result.name).then(function(filing) {
-        filing.ticker = trimmed;
-        return filing;
+      // Get the specific fund name by searching EDGAR for this ticker
+      return resolveFundName(trimmed, tickerInfo.seriesId).then(function(resolvedName) {
+        var fundName = resolvedName || trimmed;
+        return getLatestNportByCik(tickerInfo.cik, fundName).then(function(filing) {
+          return { filing: filing, fundName: fundName };
+        });
       });
+
+    }).then(function(result) {
+      return findDocInIndex(result.filing, result.fundName).then(function(doc) {
+        return renderResult(res, trimmed, result.filing, doc);
+      });
+    }).catch(function(err) {
+      jsonResp(res, 500, { error: err.message });
     });
+
   } else {
-    filingPromise = searchByName(trimmed);
+    searchByName(trimmed).then(function(filing) {
+      return findDocInIndex(filing, filing.entityName).then(function(doc) {
+        return renderResult(res, trimmed, filing, doc);
+      });
+    }).catch(function(err) {
+      jsonResp(res, 500, { error: err.message });
+    });
+  }
+}
+
+function renderResult(res, query, filing, doc) {
+  var holdings = parseHoldings(doc.body).holdings;
+
+  if (holdings.length < 3) {
+    return jsonResp(res, 422, {
+      error:  "Only parsed " + holdings.length + " holdings. Document format may be unsupported.",
+      docUrl: doc.docUrl
+    });
   }
 
-  filingPromise.then(function(filing) {
-    var fundName = filing.entityName || trimmed;
-    return findDocInIndex(filing, fundName).then(function(doc) {
-      var holdings = parseHoldings(doc.body).holdings;
-
-      if (holdings.length < 3) {
-        return jsonResp(res, 422, {
-          error:  "Only parsed " + holdings.length + " holdings. Document format may be unsupported.",
-          docUrl: doc.docUrl
-        });
-      }
-
-      var total = holdings.reduce(function(s, h) { return s + h.value; }, 0);
-      jsonResp(res, 200, {
-        query:      trimmed,
-        fundName:   fundName,
-        period:     filing.period,
-        filingDate: filing.filingDate,
-        docUrl:     doc.docUrl,
-        indexUrl:   doc.indexUrl,
-        netAssets:  total,
-        count:      holdings.length,
-        holdings:   holdings.map(function(h) {
-          return Object.assign({}, h, { pct: parseFloat(((h.value / total) * 100).toFixed(4)) });
-        })
-      });
-    });
-  }).catch(function(err) {
-    jsonResp(res, 500, { error: err.message });
+  var total = holdings.reduce(function(s, h) { return s + h.value; }, 0);
+  jsonResp(res, 200, {
+    query:      query,
+    fundName:   filing.entityName,
+    period:     filing.period,
+    filingDate: filing.filingDate,
+    docUrl:     doc.docUrl,
+    indexUrl:   doc.indexUrl,
+    netAssets:  total,
+    count:      holdings.length,
+    holdings:   holdings.map(function(h) {
+      return Object.assign({}, h, { pct: parseFloat(((h.value / total) * 100).toFixed(4)) });
+    })
   });
 }
 
@@ -433,11 +407,11 @@ function serveStatic(res, filePath) {
   });
 }
 
-// ── Pre-warm cache on startup ─────────────────────────────────────────────
+// ── Pre-warm cache ────────────────────────────────────────────────────────
 setTimeout(function() {
-  getMfTickers().catch(function(e) { console.log("MF ticker pre-warm failed:", e.message); });
+  getMfTickers().catch(function(e) { console.log("Pre-warm failed:", e.message); });
   setTimeout(function() {
-    getStockTickers().catch(function(e) { console.log("Stock ticker pre-warm failed:", e.message); });
+    getStockTickers().catch(function() {});
   }, 3000);
 }, 2000);
 
